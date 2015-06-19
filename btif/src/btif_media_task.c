@@ -229,11 +229,21 @@ static UINT32 a2dp_media_task_stack[(A2DP_MEDIA_TASK_STACK_SIZE + 3) / 4];
    but due to link flow control or thread preemption in lower
    layers we might need to temporarily buffer up data */
 
-/* 18 frames is equivalent to 6.89*24*2.9 ~= 360 ms @ 44.1 khz, 20 ms mediatick */
-#define MAX_OUTPUT_A2DP_FRAME_QUEUE_SZ 18
+/* 18 frames is equivalent to 6.89*18*2.9 ~= 360 ms @ 44.1 khz, 20 ms mediatick */
+#define MAX_SINK_A2DP_FRAME_QUEUE_SZ 18
+
+/* Allow up to 360ms of buffered A2DP data */
+#define MAX_OUTPUT_A2DP_QUEUE_MS 360
 
 #ifndef MAX_PCM_FRAME_NUM_PER_TICK
+#ifdef SAMPLE_RATE_48K
+/* If a frame is 512 bytes and a tick is 3840 bytes (48K) then allow up to
+ * two full ticks to be sent per tick which is 9680 / 512 = 18
+ */
+#define MAX_PCM_FRAME_NUM_PER_TICK 18
+#else
 #define MAX_PCM_FRAME_NUM_PER_TICK 14
+#endif
 #endif
 
 #define MAX_PCM_ITER_NUM_PER_TICK     2
@@ -447,6 +457,14 @@ const char* dump_media_event(UINT16 event)
         default:
             return "UNKNOWN MEDIA EVENT";
     }
+}
+
+static inline UINT32 compute_pcm_bytes_per_frame(void)
+{
+    return btif_media_cb.encoder.s16NumOfSubBands *
+           btif_media_cb.encoder.s16NumOfBlocks *
+           btif_media_cb.media_feeding.cfg.pcm.num_channel *
+           btif_media_cb.media_feeding.cfg.pcm.bit_per_sample / 8;
 }
 
 /*****************************************************************************
@@ -2730,13 +2748,23 @@ static UINT8 check_for_max_number_of_frames_per_packet()
     return result;
 }
 
+static inline UINT64 now_us_rounded_to_nearest_tick(void)
+{
+    UINT32 tick_us = BTIF_MEDIA_TIME_TICK * 1000;
+    return (GKI_now_us() + tick_us/2) / tick_us * tick_us;
+}
+
 /*******************************************************************************
  **
  ** Function         btif_get_num_aa_frame
  **
  ** Description
  **
- ** Returns          The number of media frames in this time slice
+ ** Returns          The number of media frames in this time slice.  When a
+ **                  partial time slice has occurred, we round to the nearest
+ **                  total number of time slices.  This avoids all rounding errors
+ **                  that could occur in computing the amount of data that should
+ **                  be sent.
  **
  *******************************************************************************/
 static UINT8 btif_get_num_aa_frame(void)
@@ -2747,13 +2775,9 @@ static UINT8 btif_get_num_aa_frame(void)
     {
         case BTIF_MEDIA_TRSCD_PCM_2_SBC:
         {
-            UINT32 pcm_bytes_per_frame = btif_media_cb.encoder.s16NumOfSubBands *
-                             btif_media_cb.encoder.s16NumOfBlocks *
-                             btif_media_cb.media_feeding.cfg.pcm.num_channel *
-                             btif_media_cb.media_feeding.cfg.pcm.bit_per_sample / 8;
-
+            UINT32 pcm_bytes_per_frame = compute_pcm_bytes_per_frame();
             UINT32 us_this_tick = BTIF_MEDIA_TIME_TICK * 1000;
-            UINT64 now_us = GKI_now_us();
+            UINT64 now_us = now_us_rounded_to_nearest_tick();
             if (last_frame_us != 0)
                 us_this_tick = (now_us - last_frame_us);
             last_frame_us = now_us;
@@ -2805,7 +2829,7 @@ UINT8 btif_media_sink_enque_buf(BT_HDR *p_pkt)
 
     if(btif_media_cb.rx_flush == TRUE) /* Flush enabled, do not enque*/
         return btif_media_cb.RxSbcQ.count;
-    if(btif_media_cb.RxSbcQ.count == MAX_OUTPUT_A2DP_FRAME_QUEUE_SZ)
+    if(btif_media_cb.RxSbcQ.count == MAX_SINK_A2DP_FRAME_QUEUE_SZ)
     {
         GKI_freebuf(GKI_dequeue(&(btif_media_cb.RxSbcQ)));
     }
@@ -3158,13 +3182,22 @@ static void btif_media_aa_prep_sbc_2_send(UINT8 nb_frame)
 
 static void btif_media_aa_prep_2_send(UINT8 nb_frame)
 {
+    UINT32 pcm_bytes_per_frame = compute_pcm_bytes_per_frame();
+    UINT32 max_pcm_bytes;
+    UINT32 max_frames;
+
+    max_pcm_bytes = btif_media_cb.media_feeding_state.pcm.bytes_per_tick *
+                    MAX_OUTPUT_A2DP_QUEUE_MS /
+                    BTIF_MEDIA_TIME_TICK;
+    max_frames = max_pcm_bytes / pcm_bytes_per_frame;
+
     VERBOSE("%s() - frames=%d (queue=%d)", __FUNCTION__, nb_frame,
                                         btif_media_cb.TxAaQ.count)
 
-    while (btif_media_cb.TxAaQ.count >= (MAX_OUTPUT_A2DP_FRAME_QUEUE_SZ-nb_frame))
+    while (btif_media_cb.TxAaQ.count > (max_frames-nb_frame))
     {
-        APPL_TRACE_WARNING("%s() - TX queue buffer count %d",
-            __FUNCTION__, btif_media_cb.TxAaQ.count);
+        APPL_TRACE_WARNING("%s() - TX queue buffer count %d max_frames %d nb_frame %d",
+            __FUNCTION__, btif_media_cb.TxAaQ.count, max_frames, nb_frame);
         GKI_freebuf(GKI_dequeue(&(btif_media_cb.TxAaQ)));
     }
 
